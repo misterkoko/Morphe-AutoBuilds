@@ -1,8 +1,5 @@
 name: Auto Build and Release ReVanced
 
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-
 on:
   workflow_dispatch:
     inputs:
@@ -69,6 +66,13 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+
+      - name: Validate GitHub Auth
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python scripts/validate_github_auth.py
 
       - name: Run Incremental Update Check
         id: check
@@ -222,85 +226,26 @@ jobs:
           pattern: build-records-*
         continue-on-error: true
 
-      - name: Carry Over Unchanged APKs From Previous Release
-        if: needs.check-updates.outputs.incremental == 'true'
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -e
-          mkdir -p ./carry-apks
-          PLAN_FILE="./build-plan/carry_over.json"
-          if [ ! -f "$PLAN_FILE" ]; then
-            echo "No carry_over.json plan found; skipping carry-over."
-            exit 0
-          fi
-          CARRY_COUNT=$(jq 'length' "$PLAN_FILE")
-          echo "Carry-over plan has $CARRY_COUNT APK(s)."
-          if [ "$CARRY_COUNT" -eq 0 ]; then
-            echo "Nothing to carry over."
-            exit 0
-          fi
-          if ! gh release view latest >/dev/null 2>&1; then
-            echo "⚠️ No previous 'latest' release exists; cannot carry over. Continuing without carry-over."
-            exit 0
-          fi
-          # Download each carry-over APK individually so a single missing asset
-          # doesn't abort the entire job.
-          jq -r '.[].apk' "$PLAN_FILE" | while read -r apk_name; do
-            [ -z "$apk_name" ] && continue
-            echo "↩️  Carrying over: $apk_name"
-            if ! gh release download latest --pattern "$apk_name" --dir ./carry-apks --clobber 2>/dev/null; then
-              echo "   ⚠️  Could not download $apk_name from previous release (will be skipped)."
-            fi
-          done
-          echo "Carry-over APKs:"
-          ls -la ./carry-apks/ 2>/dev/null || true
-
       - name: Check if Any APKs Were Built
         id: check-apks
         run: |
           built_count=$(find ./all-apks -name "*.apk" 2>/dev/null | wc -l)
-          carry_count=$(find ./carry-apks -name "*.apk" 2>/dev/null | wc -l || echo 0)
-          total_count=$((built_count + carry_count))
-          echo "Built APKs: $built_count, Carry-over APKs: $carry_count, Total: $total_count"
+          echo "Built APKs: $built_count"
 
-          if [ $total_count -eq 0 ]; then
-            echo "❌ No APKs available (built or carried-over)"
+          if [ "$built_count" -eq 0 ]; then
+            echo "❌ No rebuilt APKs available"
             echo "skip_release=true" >> $GITHUB_OUTPUT
           else
-            echo "✅ $total_count APK(s) ready for release"
+            echo "✅ $built_count rebuilt APK(s) ready for release"
             echo "skip_release=false" >> $GITHUB_OUTPUT
-          fi
-      
-      - name: Delete Old Release
-        if: steps.check-apks.outputs.skip_release == 'false'
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          # Check if "latest" release exists and delete it
-          echo "🔄 Checking for existing 'latest' release..."
-          if gh release view latest >/dev/null 2>&1; then
-            echo "🗑️ Deleting old 'latest' release..."
-            gh release delete latest --yes --cleanup-tag
-            echo "✅ Old release deleted"
-          else
-            echo "📭 No existing 'latest' release found"
           fi
       
       - name: Collect All APKs
         if: steps.check-apks.outputs.skip_release == 'false'
         run: |
           mkdir -p ./release-apks
-
-          # Copy freshly built APKs
-          echo "📦 Collecting freshly built APKs..."
-          find ./all-apks -name "*.apk" -exec cp -n {} ./release-apks/ \; 2>/dev/null || true
-
-          # Copy carry-over APKs (don't overwrite if same name appeared in build)
-          if [ -d ./carry-apks ]; then
-            echo "📦 Collecting carry-over APKs..."
-            find ./carry-apks -name "*.apk" -exec cp -n {} ./release-apks/ \; 2>/dev/null || true
-          fi
+          echo "📦 Collecting rebuilt APKs..."
+          find ./all-apks -name "*.apk" -exec cp -f {} ./release-apks/ \; 2>/dev/null || true
 
           echo "📁 APKs ready for release:"
           ls -la ./release-apks/
@@ -330,57 +275,67 @@ jobs:
             jq '.entries | length' manifest.json || true
             cp manifest.json ./release-apks/manifest.json
           fi
+
+      - name: Validate GitHub Auth
+        if: steps.check-apks.outputs.skip_release == 'false'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python scripts/validate_github_auth.py
+
+      - name: Check Existing Release
+        if: steps.check-apks.outputs.skip_release == 'false'
+        id: check-release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view latest >/dev/null 2>&1; then
+            echo "release_exists=true" >> "$GITHUB_OUTPUT"
+            echo "✅ Release 'latest' exists; assets will be updated in place."
+          else
+            echo "release_exists=false" >> "$GITHUB_OUTPUT"
+            echo "📭 Release 'latest' does not exist; it will be created."
+          fi
       
       - name: Generate Release Notes
         if: steps.check-apks.outputs.skip_release == 'false'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           echo "📝 Generating release notes..."
-          
+
+          if [ "${{ steps.check-release.outputs.release_exists }}" = "true" ]; then
+            gh release view latest --json assets --jq '.assets[].name' > current_assets.txt
+          else
+            : > current_assets.txt
+          fi
+
+          for apk in ./release-apks/*.apk; do
+            [ -f "$apk" ] || continue
+            basename "$apk" >> current_assets.txt
+          done
+
+          if [ -f ./release-apks/manifest.json ]; then
+            echo "manifest.json" >> current_assets.txt
+          fi
+
+          sort -u current_assets.txt > release_assets.txt
+
           cat > release_notes.md << 'EOF'
           # ReVanced APKs - Auto Built
           
           ## 📱 Available Apps
           
           EOF
-          
-          # Group apps by name (remove architecture suffix for grouping)
-          declare -A app_info
-          
-          for apk in ./release-apks/*.apk; do
-            if [ -f "$apk" ]; then
-              filename=$(basename "$apk")
-              
-              # Extract app name (remove architecture and version info)
-              app_name=$(echo "$filename" | sed -E 's/-(arm64-v8a|armeabi-v7a|universal|patch|revanced|cli)-.*//' | sed 's/-/ /g')
-              
-              # Extract architecture
-              if [[ "$filename" == *"arm64-v8a"* ]]; then
-                arch="arm64-v8a"
-              elif [[ "$filename" == *"armeabi-v7a"* ]]; then
-                arch="armeabi-v7a"
-              else
-                arch="universal"
-              fi
-              
-              # Extract version
-              version=$(echo "$filename" | grep -oE 'v[0-9]+\.[0-9]+(\.[0-9]+)*' | head -1 || echo "unknown")
-              
-              # Store in associative array
-              key="$app_name"
-              if [ -z "${app_info[$key]}" ]; then
-                app_info[$key]=""
-              fi
-              app_info[$key]="${app_info[$key]}<br>• $arch: $version"
-            fi
-          done
-          
-          # Create a simple markdown list
-          for app in "${!app_info[@]}"; do
-            echo "### $app" >> release_notes.md
-            echo "${app_info[$app]:4}" | sed 's/<br>/\n/g' >> release_notes.md
-            echo "" >> release_notes.md
-          done
-          
+
+          while read -r filename; do
+            [ -n "$filename" ] || continue
+            echo "- $filename" >> release_notes.md
+          done < release_assets.txt
+
           cat >> release_notes.md << 'EOF'
           ---
           
@@ -401,15 +356,16 @@ jobs:
           ## 🔄 Update Schedule
           - Automatic updates daily at 6 AM UTC
           - Manual updates available via workflow dispatch
-          - Always replaces the previous release
+          - Creates `latest` if missing and uploads rebuilt assets in place
           EOF
       
-      - name: Create New Release
+      - name: Upload Or Create Release
         if: steps.check-apks.outputs.skip_release == 'false'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          echo "🚀 Creating new release with APKs..."
+          echo "🚀 Publishing rebuilt assets to release..."
 
           # Count APKs
           apk_count=$(ls -1 ./release-apks/*.apk 2>/dev/null | wc -l || echo "0")
@@ -428,19 +384,28 @@ jobs:
             echo "📎 Including manifest.json"
           fi
 
-          # Create the release
-          gh release create "latest" \
-            --title "ReVanced APKs - $(date +'%Y-%m-%d %H:%M')" \
-            --notes-file release_notes.md \
-            "${ASSETS[@]}" \
-            --latest
+          if [ "${{ steps.check-release.outputs.release_exists }}" = "true" ]; then
+            echo "⬆️ Uploading rebuilt assets in place and refreshing release metadata..."
+            gh release upload latest "${ASSETS[@]}" --clobber
+            gh release edit latest \
+              --title "ReVanced APKs - $(date +'%Y-%m-%d %H:%M')" \
+              --notes-file release_notes.md
+          else
+            echo "🆕 Creating 'latest' release..."
+            gh release create "latest" \
+              --title "ReVanced APKs - $(date +'%Y-%m-%d %H:%M')" \
+              --notes-file release_notes.md \
+              "${ASSETS[@]}" \
+              --latest
+          fi
 
-          echo "✅ Release created successfully!"
+          echo "✅ Release publish step completed successfully!"
       
       - name: Display Release URL
         if: steps.check-apks.outputs.skip_release == 'false'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           release_url=$(gh release view latest --json url --jq .url)
           echo "🔗 Release URL: $release_url"

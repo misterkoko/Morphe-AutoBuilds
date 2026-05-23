@@ -25,10 +25,20 @@ def detect_arch_from_filename(apk_name: str, default: str = "universal") -> str:
     if not apk_name:
         return default
     base = apk_name.lower()
-    for a in KNOWN_ARCHES:
-        # match -arch- to avoid matching a substring inside another token
-        if f"-{a}-" in base or base.endswith(f"-{a}.apk"):
-            return a
+    
+    # Check for specific arch tokens in the filename
+    # Order matters: check more specific ones first
+    if "arm64-v8a" in base:
+        return "arm64-v8a"
+    if "armeabi-v7a" in base:
+        return "armeabi-v7a"
+    if "x86_64" in base:
+        return "x86_64"
+    if "x86" in base:
+        return "x86"
+    if "universal" in base:
+        return "universal"
+        
     return default
 
 

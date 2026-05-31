@@ -1,1 +1,5 @@
-- Hide inbox ads
++ Hide inbox ads
++ Disable typing indicator
++ Hide inbox subtabs
++ Hide Facebook button
++ Remove Meta AI
